@@ -1,0 +1,12 @@
+[Unit]
+Description=mysql5ram Docker container
+StopWhenUnneeded=true
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/bash -c 'docker start -a mysql5ram & until nc -z 127.0.0.1 3303 2>/dev/null; do sleep 0.1; done; systemd-notify --ready; wait'
+ExecStop=/usr/bin/docker stop mysql5ram
+TimeoutStartSec={{TIMEOUT}}
+ExecStartPost=-/usr/bin/runuser -u {{USERNAME}} -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{UID}}/bus /usr/bin/notify-send "mysql5ram" "Container started"
+ExecStopPost=-/usr/bin/runuser -u {{USERNAME}} -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{UID}}/bus /usr/bin/notify-send "mysql5ram" "Container stopped"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Socket for mysql5ram on-demand activation
+
+[Socket]
+ListenStream=53303
+Service=mysql5ram-proxy.service
+
+[Install]
+WantedBy=sockets.target
