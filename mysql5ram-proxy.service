@@ -1,7 +1,0 @@
-[Unit]
-Description=Proxy for mysql5ram
-Requires=mysql5ram.service
-After=mysql5ram.service
-
-[Service]
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=15min 127.0.0.1:3303

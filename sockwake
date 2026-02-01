@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""sockwake — create/remove/list systemd socket-activated Docker container wrappers."""
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SYSTEMD_DIR = Path("/etc/systemd/system")
+MANAGED_BY = "sockwake"
+
+# ---------------------------------------------------------------------------
+# Unit templates
+# ---------------------------------------------------------------------------
+
+SOCKET_TEMPLATE = """\
+[Unit]
+Description=Socket for {name} on-demand activation
+X-ManagedBy={managed_by}
+X-InstanceConfig={config_json}
+
+[Socket]
+ListenStream={listen_port}
+Service={name}-proxy.service
+
+[Install]
+WantedBy=sockets.target
+"""
+
+PROXY_TEMPLATE = """\
+[Unit]
+Description=Proxy for {name}
+X-ManagedBy={managed_by}
+Requires={name}.service
+After={name}.service
+
+[Service]
+ExecStart={proxyd_path} --exit-idle-time={idle_timeout} 127.0.0.1:{container_port}
+"""
+
+SERVICE_TEMPLATE = """\
+[Unit]
+Description={name} Docker container
+X-ManagedBy={managed_by}
+StopWhenUnneeded=true
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart={bash_path} -c 'docker start -a {container_name} & {health_check_loop}systemd-notify --ready; wait'
+ExecStop={docker_path} stop {container_name}
+TimeoutStartSec={startup_timeout}
+{notification_lines}\
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def resolve_bin(name, fallback=None):
+    """Resolve binary path via shutil.which with optional fallback."""
+    path = shutil.which(name)
+    if path:
+        return path
+    if fallback and os.path.isfile(fallback):
+        return fallback
+    return fallback or name
+
+
+def error(msg, code=1):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, check=True, capture=False):
+    """Run a shell command, optionally capturing output."""
+    kwargs = {"check": check}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+        kwargs["text"] = True
+    return subprocess.run(cmd, **kwargs)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        error("This command must be run as root (use sudo).")
+
+
+def validate_name(name):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        error(f"Invalid instance name '{name}': must match [a-zA-Z0-9_-]+")
+
+
+def validate_port(port, label="port"):
+    if not (1 <= port <= 65535):
+        error(f"Invalid {label}: {port} (must be 1-65535)")
+
+
+def parse_duration(value):
+    """Parse a human-friendly duration string into a systemd time span.
+
+    Accepts formats like: 30, 30s, 5m, 15min, 1h, 2h30m, etc.
+    Normalizes shorthand: 'm' → 'min', 'h' → 'h', bare number → 's'.
+    Returns a valid systemd time span string.
+    """
+    value = value.strip()
+    if not value:
+        error("Empty duration value")
+
+    # Bare integer → treat as seconds
+    if re.fullmatch(r"\d+", value):
+        return f"{value}s"
+
+    # Expand shorthand: replace standalone 'm' with 'min' (but not 'min', 'ms', 'month')
+    normalized = re.sub(r"(\d+)m(?!i|s|o)", r"\1min", value)
+
+    # Validate against systemd time span pattern
+    if not re.fullmatch(r"(\d+\s*(usec|msec|ms|us|s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?|w|weeks?|months?|M|y|years?)?\s*)+", normalized):
+        error(f"Invalid duration '{value}': use e.g. 30s, 5m, 1h, 2h30m")
+
+    return normalized
+
+
+def discover_instances():
+    """Scan systemd dir for socket units managed by sockwake."""
+    instances = []
+    if not SYSTEMD_DIR.is_dir():
+        return instances
+    for path in sorted(SYSTEMD_DIR.glob("*.socket")):
+        try:
+            content = path.read_text()
+        except OSError:
+            continue
+        if f"X-ManagedBy={MANAGED_BY}" not in content:
+            continue
+        for line in content.splitlines():
+            if line.startswith("X-InstanceConfig="):
+                try:
+                    config = json.loads(line[len("X-InstanceConfig="):])
+                    instances.append(config)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+    return instances
+
+
+def get_unit_status(unit_name):
+    """Return 'active', 'inactive', or other systemctl status."""
+    result = run(
+        ["systemctl", "is-active", unit_name],
+        check=False, capture=True,
+    )
+    return result.stdout.strip()
+
+
+def selinux_available():
+    """Check if semanage is available."""
+    return shutil.which("semanage") is not None
+
+
+def selinux_add_port(port):
+    if selinux_available():
+        run(["semanage", "port", "-a", "-t", "systemd_socket_proxyd_port_t",
+             "-p", "tcp", str(port)], check=False)
+
+
+def selinux_remove_port(port):
+    if selinux_available():
+        run(["semanage", "port", "-d", "-t", "systemd_socket_proxyd_port_t",
+             "-p", "tcp", str(port)], check=False)
+
+
+# ---------------------------------------------------------------------------
+# Unit generation
+# ---------------------------------------------------------------------------
+
+def generate_units(args):
+    """Generate unit file contents. Returns dict of {filename: content}."""
+    config = {
+        "name": args.name,
+        "listen_port": args.listen_port,
+        "container_port": args.container_port,
+        "container_name": args.container_name,
+    }
+    config_json = json.dumps(config, separators=(",", ":"))
+
+    idle_timeout = parse_duration(args.idle_timeout)
+    startup_timeout = parse_duration(args.startup_timeout)
+
+    proxyd_path = resolve_bin("systemd-socket-proxyd", "/usr/lib/systemd/systemd-socket-proxyd")
+    bash_path = resolve_bin("bash", "/bin/bash")
+    docker_path = resolve_bin("docker", "/usr/bin/docker")
+
+    # Health check loop
+    if args.health_check == "none":
+        health_check_loop = ""
+    else:
+        health_cmd = args.health_check.format(container_port=args.container_port)
+        health_check_loop = f"until {health_cmd} 2>/dev/null; do sleep 0.1; done; "
+
+    # Notification lines
+    notification_lines = ""
+    if not args.no_notifications:
+        username = args.user
+        try:
+            uid = pwd.getpwnam(username).pw_uid
+        except KeyError:
+            uid = os.getuid()
+        runuser_path = resolve_bin("runuser", "/usr/bin/runuser")
+        notify_send_path = resolve_bin("notify-send", "/usr/bin/notify-send")
+        notification_lines = (
+            f'ExecStartPost=-{runuser_path} -u {username} -- '
+            f'env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus '
+            f'{notify_send_path} "{args.name}" "Container started"\n'
+            f'ExecStopPost=-{runuser_path} -u {username} -- '
+            f'env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus '
+            f'{notify_send_path} "{args.name}" "Container stopped"\n'
+        )
+
+    units = {}
+    units[f"{args.name}.socket"] = SOCKET_TEMPLATE.format(
+        name=args.name,
+        managed_by=MANAGED_BY,
+        config_json=config_json,
+        listen_port=args.listen_port,
+    )
+    units[f"{args.name}-proxy.service"] = PROXY_TEMPLATE.format(
+        name=args.name,
+        managed_by=MANAGED_BY,
+        proxyd_path=proxyd_path,
+        idle_timeout=idle_timeout,
+        container_port=args.container_port,
+    )
+    units[f"{args.name}.service"] = SERVICE_TEMPLATE.format(
+        name=args.name,
+        managed_by=MANAGED_BY,
+        bash_path=bash_path,
+        container_name=args.container_name,
+        health_check_loop=health_check_loop,
+        docker_path=docker_path,
+        startup_timeout=startup_timeout,
+        notification_lines=notification_lines,
+    )
+
+    return units
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_create(args):
+    """Create a new socket-activated Docker container wrapper."""
+    validate_name(args.name)
+    validate_port(args.listen_port, "listen-port")
+    validate_port(args.container_port, "container-port")
+
+    # Dry-run skips root and system checks
+    if not args.dry_run:
+        require_root()
+
+        # Check for port conflicts with other managed instances
+        for inst in discover_instances():
+            if inst["name"] == args.name and not args.force:
+                error(f"Instance '{args.name}' already exists. Use --force to overwrite.")
+            if inst["name"] != args.name and inst["listen_port"] == args.listen_port:
+                error(f"Listen port {args.listen_port} already used by instance '{inst['name']}'.")
+
+        # Check for non-managed units with same name
+        if not args.force:
+            for suffix in [".socket", "-proxy.service", ".service"]:
+                unit_path = SYSTEMD_DIR / f"{args.name}{suffix}"
+                if unit_path.exists():
+                    try:
+                        content = unit_path.read_text()
+                        if f"X-ManagedBy={MANAGED_BY}" not in content:
+                            error(
+                                f"Unit {unit_path.name} exists but is not managed by {MANAGED_BY}. "
+                                "Use --force to overwrite."
+                            )
+                    except OSError:
+                        pass
+
+        # Check Docker container exists
+        result = run(
+            ["docker", "inspect", args.container_name],
+            check=False, capture=True,
+        )
+        if result.returncode != 0:
+            error(f"Docker container '{args.container_name}' does not exist.")
+
+    units = generate_units(args)
+
+    if args.dry_run:
+        for filename, content in units.items():
+            print(f"# --- {filename} ---")
+            print(content)
+        return
+
+    # Write unit files
+    written = []
+    try:
+        for filename, content in units.items():
+            dest = SYSTEMD_DIR / filename
+            dest.write_text(content)
+            written.append(dest)
+    except OSError as e:
+        # Rollback
+        for path in written:
+            path.unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"], check=False)
+        error(f"Failed to write unit files: {e}", code=2)
+
+    # SELinux
+    if not args.no_selinux:
+        selinux_add_port(args.container_port)
+
+    # Reload and enable
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", f"{args.name}.socket"])
+
+    print(f"Created instance '{args.name}': port {args.listen_port} → container {args.container_name}:{args.container_port}")
+
+
+def cmd_remove(args):
+    """Remove socket-activated Docker container wrapper(s)."""
+    require_root()
+
+    if args.all:
+        instances = discover_instances()
+        if not instances:
+            print("No managed instances found.")
+            return
+        for inst in instances:
+            _remove_instance(inst["name"], inst.get("container_port"), args.no_selinux)
+    elif args.name:
+        validate_name(args.name)
+        # Find the instance config to get container_port for SELinux cleanup
+        container_port = None
+        for inst in discover_instances():
+            if inst["name"] == args.name:
+                container_port = inst.get("container_port")
+                break
+        _remove_instance(args.name, container_port, args.no_selinux)
+    else:
+        error("Specify --name or --all.")
+
+
+def _remove_instance(name, container_port, no_selinux):
+    """Remove a single instance's units."""
+    socket_unit = f"{name}.socket"
+    proxy_unit = f"{name}-proxy.service"
+    service_unit = f"{name}.service"
+
+    # Stop and disable
+    run(["systemctl", "disable", "--now", socket_unit], check=False)
+    run(["systemctl", "stop", proxy_unit], check=False)
+    run(["systemctl", "stop", service_unit], check=False)
+
+    # Remove unit files
+    for unit in [socket_unit, proxy_unit, service_unit]:
+        path = SYSTEMD_DIR / unit
+        path.unlink(missing_ok=True)
+
+    run(["systemctl", "daemon-reload"])
+
+    # SELinux cleanup
+    if not no_selinux and container_port:
+        selinux_remove_port(container_port)
+
+    print(f"Removed instance '{name}'.")
+
+
+def cmd_list(args):
+    """List managed instances."""
+    instances = discover_instances()
+
+    if args.json:
+        for inst in instances:
+            inst["status"] = get_unit_status(f"{inst['name']}.socket")
+        print(json.dumps(instances, indent=2))
+        return
+
+    if not instances:
+        print("No managed instances.")
+        return
+
+    # Table output
+    header = f"{'NAME':<20} {'LISTEN_PORT':<13} {'CONTAINER_PORT':<16} {'CONTAINER':<20} {'STATUS':<10}"
+    print(header)
+    print("-" * len(header))
+    for inst in instances:
+        status = get_unit_status(f"{inst['name']}.socket")
+        print(
+            f"{inst['name']:<20} {inst['listen_port']:<13} {inst['container_port']:<16} "
+            f"{inst['container_name']:<20} {status:<10}"
+        )
+
+
+def cmd_status(args):
+    """Show detailed status of one instance."""
+    validate_name(args.name)
+
+    found = False
+    for inst in discover_instances():
+        if inst["name"] == args.name:
+            found = True
+            break
+    if not found:
+        error(f"Instance '{args.name}' not found.")
+
+    for unit in [f"{args.name}.socket", f"{args.name}-proxy.service", f"{args.name}.service"]:
+        print(f"=== {unit} ===")
+        run(["systemctl", "status", unit, "--no-pager", "-l"], check=False)
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="sockwake",
+        description="Create/remove/list systemd socket-activated Docker container wrappers.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # create
+    p_create = sub.add_parser("create", help="Create a new instance")
+    p_create.add_argument("--name", required=True, help="Instance name (systemd unit prefix)")
+    p_create.add_argument("--listen-port", type=int, required=True, help="External port for .socket")
+    p_create.add_argument("--container-port", type=int, required=True, help="Internal port container exposes")
+    p_create.add_argument("--container-name", required=True, help="Docker container name")
+    p_create.add_argument("--startup-timeout", default="30s", help="Duration before systemd gives up (default: 30s)")
+    p_create.add_argument("--idle-timeout", default="15m", help="Duration before proxy exits on idle (default: 15m)")
+    p_create.add_argument(
+        "--health-check", default="nc -z 127.0.0.1 {container_port}",
+        help="Health check command ({container_port} substituted); 'none' to disable",
+    )
+    p_create.add_argument("--no-notifications", action="store_true", help="Disable desktop notifications")
+    p_create.add_argument("--user", default=os.environ.get("SUDO_USER", os.environ.get("USER", "root")),
+                          help="User for desktop notifications")
+    p_create.add_argument("--no-selinux", action="store_true", help="Skip SELinux port labeling")
+    p_create.add_argument("--dry-run", action="store_true", help="Print units to stdout without installing")
+    p_create.add_argument("--force", action="store_true", help="Overwrite existing units")
+
+    # remove
+    p_remove = sub.add_parser("remove", help="Remove instance(s)")
+    p_remove.add_argument("--name", help="Instance name to remove")
+    p_remove.add_argument("--all", action="store_true", help="Remove all managed instances")
+    p_remove.add_argument("--no-selinux", action="store_true", help="Skip SELinux port cleanup")
+
+    # list
+    p_list = sub.add_parser("list", help="List managed instances")
+    p_list.add_argument("--json", action="store_true", help="JSON output")
+
+    # status
+    p_status = sub.add_parser("status", help="Detailed status of one instance")
+    p_status.add_argument("--name", required=True, help="Instance name")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    commands = {
+        "create": cmd_create,
+        "remove": cmd_remove,
+        "list": cmd_list,
+        "status": cmd_status,
+    }
+    try:
+        commands[args.command](args)
+    except subprocess.CalledProcessError as e:
+        error(f"Command failed: {e}", code=2)
+
+
+if __name__ == "__main__":
+    main()
